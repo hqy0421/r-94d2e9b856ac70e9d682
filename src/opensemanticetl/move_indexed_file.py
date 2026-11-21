@@ -3,6 +3,7 @@
 import urllib.request
 import urllib.parse
 import json
+from collections import Counter
 from itertools import starmap
 
 
@@ -54,6 +55,69 @@ def move_dir(host: str, src: str, dest: str, prefix=""):
     post(host, request_payload)
 
 
+class MoveConflictError(ValueError):
+    """Conflicts were detected while planning a batch directory
+    move, so no update was sent to the index
+    """
+    def __init__(self, conflicts):
+        super().__init__(
+            "Conflicting batch directory move, index not updated:\n"
+            + "\n".join(conflicts))
+        self.conflicts = conflicts
+
+
+def move_dirs(host: str, moves: dict, prefix=""):
+    """Moves multiple directories within the index (not physically)
+    in one batch.
+
+    Each document is mapped exactly once: its original (not yet
+    rewritten) path is matched segment wise against the source
+    directories and only the rule with the longest matching source
+    prefix is applied. Therefore parent and child directories can be
+    moved within the same batch and two directories can be swapped,
+    without rules being applied to paths already rewritten by another
+    rule.
+
+    The whole batch is planned before anything is written: if
+    multiple documents would be moved to the same target or a target
+    is occupied by a document which is not moved within this batch,
+    a MoveConflictError is raised and no update is sent. Targets
+    which are old ids of documents moved (and thereby vacated) within
+    this batch are allowed: the new documents are generated from the
+    original records and afterwards only old ids which stay
+    unoccupied are deleted.
+
+    Example of usage:
+    host = "http://solr:8983/solr/opensemanticsearch/"
+    move_dirs(host, {"/archive/a": "/archive/b",
+                     "/archive/b": "/archive/a"}, prefix="file://")
+
+    :host: Url to the solr instance
+    :moves: A dict of the form {src_dir: dest_dir, ...}
+    :prefix: Prefix of the id, e.g. "file://"
+    """
+    moves_by_segments = {}
+    for src, dest in moves.items():
+        src_segments = tuple(src.strip("/").split("/"))
+        if src_segments in moves_by_segments:
+            raise ValueError("Duplicate source directory: " + src)
+        moves_by_segments[src_segments] = dest.strip("/").split("/")
+    indexed_data = get_files_in_dirs(host, moves)
+    moved_data = list(map(change_dirs_once(prefix, moves_by_segments),
+                          indexed_data))
+    old_ids = [doc["id"] for doc in indexed_data]
+    new_ids = [doc["id"] for doc in moved_data]
+    conflicts = find_conflicts(host, old_ids, new_ids)
+    if conflicts:
+        raise MoveConflictError(conflicts)
+    # Old ids which are reused as a target get overwritten by the new
+    # documents, so only old ids staying unoccupied have to be deleted
+    new_ids_set = set(new_ids)
+    delete_ids = [old_id for old_id in old_ids if old_id not in new_ids_set]
+    if moved_data:
+        post(host, prepare_payload(moved_data, delete_ids))
+
+
 def change_path(prefix: str):
     """Returns a mapping function to be used with starmap
     """
@@ -97,6 +161,42 @@ def change_dir(prefix: str, src: str, dest: str):
     return change
 
 
+def change_dirs_once(prefix: str, moves_by_segments: dict):
+    """Returns a mapping function to be used with map, applying the
+    single move rule whose source directory is the longest segment
+    wise prefix of the original path of the document
+    """
+    def change(data: dict) -> dict:
+        """Creates a modified version of data
+
+        :data: The indexed metadata of the moved file
+        """
+        path_segments = list(extract_path_components(data))
+        src_segments, dest_segments = longest_prefix_match(
+            path_segments, moves_by_segments)
+        return _change_path(
+            data, dest_segments + path_segments[len(src_segments):],
+            prefix=prefix)
+    return change
+
+
+def longest_prefix_match(path_segments: list, moves_by_segments: dict):
+    """Returns the (source, destination) segments of the move rule
+    whose source directory is the longest segment wise prefix of
+    :path_segments:
+    """
+    match = None
+    for src_segments, dest_segments in moves_by_segments.items():
+        if (tuple(path_segments[:len(src_segments)]) == src_segments
+                and (match is None
+                     or len(src_segments) > len(match[0]))):
+            match = (src_segments, dest_segments)
+    if match is None:
+        raise ValueError("No move rule matches path: /"
+                         + "/".join(path_segments))
+    return match
+
+
 def _change_path(data: dict, dest_components: tuple, prefix: str = "") -> dict:
     """Creates a modified version of data
 
@@ -126,6 +226,30 @@ def prepare_payload(adds, delete_ids):
     payload["delete"] = [
         {"id": id_} for id_ in delete_ids]
     return payload
+
+
+def find_conflicts(host: str, old_ids: list, new_ids: list) -> list:
+    """Checks the plan of a batch directory move, returning a list of
+    conflict descriptions (empty if the plan is consistent)
+    """
+    conflicts = []
+    duplicates = sorted(id_ for id_, count in Counter(new_ids).items()
+                        if count > 1)
+    if duplicates:
+        conflicts.append(
+            "Multiple documents moved to the same target: "
+            + ", ".join(duplicates))
+    # Targets which are old ids of this batch get vacated by the
+    # batch itself, only other targets must not be occupied
+    foreign_targets = sorted(set(new_ids) - set(old_ids))
+    if foreign_targets:
+        occupied = sorted(doc["id"]
+                          for doc in get_files(host, foreign_targets))
+        if occupied:
+            conflicts.append(
+                "Target occupied by document which is not moved: "
+                + ", ".join(occupied))
+    return conflicts
 
 
 class DuplicateKey(str):
@@ -185,6 +309,19 @@ def get_files_in_dir(host: str, path: str) -> list:
                    starmap(
                        'path{}_s:"{}"'.format, enumerate(path_components)
                    )))
+
+
+def get_files_in_dirs(host: str, srcs) -> list:
+    """Queries solr, searches for files in the folders :srcs:.
+
+    Each document is returned only once, even if a source directory
+    is contained in another source directory.
+    """
+    docs = {}
+    for src in srcs:
+        for doc in get_files_in_dir(host, src):
+            docs[doc["id"]] = doc
+    return list(docs.values())
 
 
 def get(host: str, query: str) -> list:
